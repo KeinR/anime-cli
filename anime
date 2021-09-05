@@ -1,0 +1,446 @@
+#!/usr/bin/bash
+
+
+function abort() {
+    if [[ $# == 1 ]]; then
+        echo "Aborted: $1"
+    else
+        echo "Aborted"
+    fi
+    exit 1
+}
+
+function exit_err_help() {
+    echo "Invalid usage: $1"
+    echo "Run 'anime help' for help"
+    exit 1
+} 
+function cmd_help() {
+    echo "
+Usage:
+    anime <command> [id] [parameters]
+
+If the command is not recognized, it's passed as an ID to 'show'.
+If no command is given, the search prompt launches, where the user can
+search for an anime by name - the ID of which is then piped to 'show'
+If a command that takes an ID is not given one, the search prompt will
+launch so that the user can select an entry that way.
+Specifying 'last' as the id will use the ID of the last result, if it exists
+
+Commands:
+    init           Create a new database, perhaps overwriting a file (prompts)
+    edit           Edit properties of a entry (see edit parameters) from ID
+    insert
+    add            Edit, except that it creates the entry (see edit parameters)
+    help           This message
+    show           Display detailed info about entry (and perhaps an image) from ID
+    tag            Filter by tag
+    list           List the names of every entry
+    watch          Convinience function that adds a given integer to the anime's
+                       watched total from ID.
+                       Interally just calls edit after retrieving the current
+                       count.
+    id             Opens the search prompt and prints the ID of the selected entry
+
+Edit parameters:
+    -n --name      (new) anime name
+    -d --date      The date
+                       Specify 'today' for today's month/year.
+                       Otherwise, must be in one the following formats:
+                       - yymm
+                       - mm/yy
+                       - mm.yy
+                       - mm-yy
+    -s --status    The status
+    -e --episode   The episode count
+    -w --watched   The number watched
+    -r --rating    The rating
+    -c --comment   Comments
+    -i --image     Image to display when showing.
+                       Is scaled up/down to 256x256 and
+                       embedded into the database
+    -t|--tag       A tag. Specifying a tag when it already exists
+                       will remove it
+    --delete       Deletes the entry, taking the entry's own ID as it's argument
+                       (redundent, I know, but I feel it's good to confirm)
+
+Variables:
+
+ANIME_DB_FILE
+    The location of the database file to be operated on.
+    Should be in a compatable schema (see source code)
+"
+    exit 1
+}
+
+function exit_ok() {
+    echo "$@"
+    exit 0
+}
+
+function exec_db() {
+    fmt="$1"
+    args=()
+    shift
+    while [[ -n "$1" ]]; do
+        args+=("$(_seq_esc "$1")")
+        shift
+    done
+    query="$(printf "$fmt" "${args[@]}")"
+    sqlite3 "$dbfile" "$query"
+    [[ $? != 0 ]] && abort "sqlite3 exited with some errors"
+}
+
+function cmd_init() {
+    if [[ -f "$dbfile" ]]; then
+        read -p "Overwrite file?[y/N]"
+        if [[ "$REPLY" != "y" ]]; then abort; fi
+        rm "$dbfile"
+    fi
+    exec_db "
+CREATE TABLE anime (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    date TEXT,
+    status TEXT,
+    episodes INTEGER,
+    watched INTEGER,
+    rating TEXT,
+    comment TEXT,
+    image BLOB
+);
+CREATE TABLE tags (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL
+);
+CREATE TABLE tagmap (
+    tag INTEGER NOT NULL,
+    anime INTEGER NOT NULL
+);
+CREATE TABLE meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
+    "
+}
+
+function _get_id() {
+    exec_db "SELECT id FROM anime WHERE name = %s" "$1"
+}
+
+function _seq_esc() {
+    echo -n '"'
+    echo -n "$*" | sed -e $'s/"/""/g'
+    echo -n '"'
+}
+
+function _cmd_edit() {
+    id="$1"
+    shift
+    num="$#"
+    cont=1
+    (( num % 2 == 1 )) && exit_err_help "Argument missing value"
+    while [[ $# != 0 && "$cont" == 1 ]]; do
+        case "$1" in
+            -n|--name)
+                exec_db "
+                    UPDATE anime SET name = %s WHERE id = %s
+                " "$2" "$id"
+                ;;
+            -d|--date)
+                dt="NULL"
+                if [[ "$2" == "today" ]]; then
+                    dt="$(date +'%y%m')"
+                elif [[ "$2" == "" ]]; then
+                    dt=""
+                elif [[ "$2" =~ ^[0-3][0-9][/.-][1-3][0-9]$ ]]; then
+                    dt="${2:3:2}${2:0:2}"
+                elif [[ "$2" =~ ^[1-3][0-9][0-3][0-9]$ ]]; then
+                    dt="$2"
+                else
+                    exit_err_help "Bad date format"
+                fi
+                exec_db "UPDATE anime SET date = %s WHERE id = %s" "$dt" "$id"
+                ;;
+            -s|--status)
+                exec_db "
+                    UPDATE anime SET status = %s WHERE id = %s
+                " "$2" "$id"
+                ;;
+            -e|--episodes)
+                exec_db "
+                    UPDATE anime SET episodes = %s WHERE id = %s
+                " "$2" "$id"
+                ;;
+            -w|--watched)
+                exec_db "
+                    UPDATE anime SET watched = %s WHERE id = %s
+                " "$2" "$id"
+                ;;
+            -r|--rating)
+                exec_db "
+                    UPDATE anime SET rating = %s WHERE id = %s
+                " "$2" "$id"
+                ;;
+            -c|--comment)
+                exec_db "
+                    UPDATE anime SET comment = %s WHERE id = %s
+                " "$2" "$id"
+                ;;
+            -i|--image)
+                [[ ! (-f "$2") ]] && abort "File does not exist"
+                tmp="$(mktemp)"
+                (cat "$2" | mogrify -resize '256x256!' -format ${2##*.} - | base64 | tr -d $'\n') > "$tmp"
+                exec_db "
+                    UPDATE anime SET image = readfile(%s) WHERE id = %s
+                " "$tmp" "$id"
+                rm "$tmp"
+                ;;
+            -t|--tag)
+                tagged="$(exec_db "SELECT 1 FROM tagmap WHERE anime = %s AND tag =
+                    (SELECT id FROM tags WHERE name = %s)" "$id" "$2")"
+                if [[ -n "$tagged" ]]; then
+                    exec_db "
+                        DELETE FROM tagmap WHERE anime = %s AND tag = (
+                            SELECT id FROM tags WHERE name = %s);
+                        DELETE FROM tags WHERE id NOT IN (SELECT tag FROM tagmap);
+                    " "$id" "$2"
+                else
+                    exec_db "
+                        INSERT INTO tags (name) SELECT %s WHERE NOT EXISTS (
+                            SELECT 1 FROM tags WHERE name = %s);
+                        INSERT INTO tagmap (tag, anime) VALUES
+                            ((SELECT id FROM tags WHERE name = %s), %s);
+                    " "$2" "$id" "$2" "$id"
+                fi
+                ;;
+            --delete)
+                [[ "$2" != "$id" ]] && exit_err_help "IDs do not match! Will not delete!"
+                cmd_show "$id"
+                read -p "Are your SURE you want to delete $id? [y/N]"
+                [[ "$REPLY" != "y" ]] && abort "Cancelled"
+                exec_db "DELETE FROM anime WHERE id = %s" "$id"
+                # Important: stop processing arguments
+                # Whle it'd be rare, we don't want to operate on a
+                # deleted entry
+                cont=0
+                ;;
+            *) exit_err_help "Unknown flag $1" ;;
+        esac
+        shift 2
+    done
+}
+
+function _fuzzy_find_id() {
+    name="$(exec_db "SELECT name FROM anime ORDER BY name DESC;" | fzf)"
+    [[ $? != 0 ]] && abort "Command failed"
+    id="$(exec_db "SELECT id FROM anime WHERE name = %s" "$name")"
+    echo -n "$id" > "$LAST_ID_TEMPFILE"
+    echo "$id"
+}
+
+function cmd_edit() {
+    id=""
+    if [[ $# != 0 ]]; then
+        if [[ "$1" =~ ^[0-9]+$ ]]; then
+            id="$1"
+            shift
+        elif [[ "$1" == "last" && -n "$last_id" ]]; then
+            id="$last_id"
+            shift
+        fi
+    fi
+    if [[ -z "$id" ]]; then
+        id="$(_fuzzy_find_id)"
+    fi
+    _cmd_edit "$id" "$@"
+}
+
+function cmd_watch() {
+    (( $# < 1 )) && exit_err_help "Need id"
+    val=1
+    if (( $# >= 2)); then
+        [[ ! ( "$2" =~ ^[0-9]+$ ) ]] && exit_err_help "Argument must be integer"
+        val="$2"
+    fi
+    id="$1"
+    if [[ "$id" == "last" ]]; then
+        id="$last_id"
+    fi
+    cur="$(exec_db "SELECT watched FROM anime WHERE id = %s" "$id")"
+    result=$(( cur + val ))
+    cmd_edit "$id" --watched "$result"
+}
+
+function cmd_add() {
+    [[ $# == 0 ]] && exit_err_help "Need name argument" 
+    name="$1"
+    shift
+    id="$(_get_id "$name")"
+    if [[ -z "$id" ]]; then
+        exec_db "INSERT INTO anime (name) VALUES (%s)" "$name"
+        id="$(_get_id "$name")"
+    else
+        abort "Entry alreadt exists! (id=$id)"
+    fi
+    cmd_edit "$id" "$@"
+}
+
+function cmd_version() {
+    echo "Lmao wtf is a version"
+}
+
+function cursor_y() {
+    # ripped and trimmed from stack exchange
+    # https://unix.stackexchange.com/questions/88296/get-vertical-cursor-position
+    # I really don't understand it, so it's just going to be a black box
+    # for now.
+    # ....
+    # based on a script from http://invisible-island.net/xterm/xterm.faq.html
+    exec < /dev/tty
+    oldstty=$(stty -g)
+    stty raw -echo min 0
+    echo -en "\033[6n" > /dev/tty
+    IFS=';' read -r -d R -a pos
+    stty $oldstty
+    # change from one-based to zero based so they work with: tput cup $row $col
+    echo -n $((${pos[0]:2} - 1))    # strip off the esc-[
+}
+
+function cmd_show() {
+    NULL="!!NULL!!" # NOTE: This isn't the only place it's defined
+    if [[ $# != 0 ]]; then
+        if [[ "$1" == "last" && -n "$last_id" ]]; then
+            id="$last_id"
+        elif [[ "$1" =~ ^[0-9]+$ ]]; then
+            id="$1"
+        else
+            exit_err_help "ID must be an integer"
+        fi
+    else
+        id="$(_fuzzy_find_id)"
+    fi
+    entry_pre="$(exec_db "SELECT * FROM anime WHERE id = %s" "$id" | perl -pe 's/\|(?=\||$)/|!!NULL!!/g')"
+    IFS='|' entry=( $entry_pre )
+
+    tags="$(exec_db "SELECT name FROM tags WHERE id IN (SELECT tag FROM tagmap WHERE anime = %s)" "$id" | sed 's/$/,/' | tr $'\n' ' ')"
+    tagssize=${#tags}
+    if (( tagssize > 2 )); then
+        tags="${tags::-2}"
+    else
+        tags="None"
+    fi
+
+    presize=50
+    size=$presize
+    isize=25
+    image="${entry[8]}"
+    if [[ "$image" != "$NULL" ]]; then
+        size=$(( presize + isize ))
+    else
+        isize=0
+    fi
+    title="[ ${entry[1]} ]"
+    date="${entry[2]}"
+    if [[ "$date" =~ ^[0-9]{4}$ ]]; then
+        MONTHS=(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
+        index="$(echo "${date:2:2}" | sed 's/^0//')"
+        index="$(( index - 1 ))"
+        (( index < 12 )) && date="${MONTHS[$index]} '${date:0:2}"
+    fi
+    titlesize=${#title}
+    titlesize=$(( (size - titlesize) / 2 ))
+    titlepad="$(printf "%${titlesize}s" | tr ' ' '=')"
+    echo "$titlepad$title$titlepad"
+    line="\n$(printf "%${isize}s")    "
+    fmt="%-${presize}s\n"
+    comment="${entry[7]}"
+    [[ "$comment" == "$NULL" ]] && comment=""
+    rating="${entry[6]}"
+    [[ "$rating" == "0" ]] && rating="?"
+    final="$(printf "$fmt$fmt$fmt$fmt$fmt$fmt$fmt" "Id: $id" "Status: ${entry[3]}" "Progress: ${entry[5]}/${entry[4]}" "Rating: $rating" "Date: ${date}" "Tags: $tags" "$comment" | fold -s -w $presize | awk "{printf \"$line%s\", \$0}" | sed 's/!!NULL!!/\?/g')"
+    # Yah, OK so, the reason I add the placeholder "!!NULL!!" is because for some reason
+    # bash decides to repalce lone question marks when expanding them into an array...
+    # I really don't know...
+    # This will just serve as a crude fix until I figure out what's wrong
+
+    num="$(echo -n "${final}" | wc -l)"
+    num="$(( 14 - num ))"
+
+    echo -n "$final"
+    echo
+    echo
+
+    if [[ "$image" != "!!NULL!!" ]]; then
+        (( num > 0 )) && printf "%${num}s" | tr ' ' $'\n'
+        y="$(cursor_y)"
+        y=$(( y - 15 ))
+        echo -n "${entry[8]}" | base64 -d | kitty +kitten icat --silent --stdin yes --place="25x25@3x${y}"
+    fi
+}
+
+function cmd_search_tag() {
+    [[ $# == 0 ]] && exit_err_help "Need one or more tag arguments"
+    template="tag = (SELECT id FROM tags WHERE name = %s)"
+    query="SELECT id,name FROM anime WHERE id = (SELECT anime FROM tagmap WHERE $template"
+    params=("$1")
+    shift
+    while [[ -n "$1" ]]; do
+        query+=" AND $template"
+        params+=("$1")
+        shift
+    done
+    query+=")"
+    exec_db "$query" "${params[@]}" | column -t -s '|'
+}
+
+function cmd_list() {
+    shopt -s nocasematch
+    tp="date"
+    order="asc"
+    if [[ $# != 0 ]]; then
+        [[ ! ( "$1" =~ date|name|rating|status|episodes|watched ) ]] && exit_err_help "Invlid specifyer '$1'"
+        tp="$1"
+        if [[ $# != 1 ]]; then
+            [[ ! ( "$2" =~ asc|desc ) ]] && exit_err_help "Invalid ordering '$2'"
+            order="$2"
+        fi
+    fi
+
+    tp2="$tp"
+    
+    [[ "$tp" =~ rating ]] && tp2="CAST (rating AS INTEGER)"
+    result="$(exec_db "SELECT id,name,$tp FROM anime ORDER BY $tp2 $order;")"
+    shopt -u nocasematch
+    echo -n "$result" | column -t -s '|'
+}
+
+function cmd_id() {
+    _fuzzy_find_id
+}
+
+[[ "$1" =~ --help|help ]] && cmd_help
+
+[[ -z "$ANIME_DB_FILE" ]] && abort "\$ANIME_DB_FILE is not set"
+
+LAST_ID_TEMPFILE="/tmp/anime.4235252rF3t24.$USER"
+
+dbfile="$ANIME_DB_FILE"
+cp "$dbfile" "$dbfile.bak"
+
+last_id="$(cat "$LAST_ID_TEMPFILE" 2> /dev/null)"
+
+case "$1" in
+    init) shift; cmd_init "$@";;
+    insert|add) shift; cmd_add "$@";;
+    version|--version) shift; cmd_version "$@";;
+    edit) shift; cmd_edit "$@";;
+    watch) shift; cmd_watch "$@" ;;
+    show) shift; cmd_show "$@";;
+    tag) shift; cmd_search_tag "$@";;
+    list) shift; cmd_list "$@";;
+    id) shift; cmd_id "$@";;
+    *) cmd_show "$@";;
+esac
+
+
