@@ -308,7 +308,8 @@ function cursor_y() {
 }
 
 function cmd_show() {
-    NULL="!!NULL!!" # NOTE: This isn't the only place it's defined
+    # Use question mark as placeholder for empty fields
+    NULL="?"
     if [[ $# != 0 ]]; then
         if [[ "$1" == "last" && -n "$last_id" ]]; then
             id="$last_id"
@@ -320,7 +321,7 @@ function cmd_show() {
     else
         id="$(_fuzzy_find_id)"
     fi
-    entry_pre="$(exec_db "SELECT * FROM anime WHERE id = %s" "$id" | perl -pe 's/\|(?=\||$)/|!!NULL!!/g')"
+    entry_pre="$(exec_db "SELECT * FROM anime WHERE id = %s" "$id" | perl -pe "s/\|(?=\||\$)/|$NULL/g")"
     IFS='|' entry=( $entry_pre )
 
     tags="$(exec_db "SELECT name FROM tags WHERE id IN (SELECT tag FROM tagmap WHERE anime = %s)" "$id" | sed 's/$/,/' | tr $'\n' ' ')"
@@ -343,6 +344,8 @@ function cmd_show() {
     title="[ ${entry[1]} ]"
     date="${entry[2]}"
     if [[ "$date" =~ ^[0-9]{4}$ ]]; then
+        # Use month number to index string value, ripped from somewhere on
+        # stack overflow
         MONTHS=(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
         index="$(echo "${date:2:2}" | sed 's/^0//')"
         index="$(( index - 1 ))"
@@ -358,24 +361,30 @@ function cmd_show() {
     [[ "$comment" == "$NULL" ]] && comment=""
     rating="${entry[6]}"
     [[ "$rating" == "0" ]] && rating="?"
-    final="$(printf "$fmt$fmt$fmt$fmt$fmt$fmt$fmt" "Id: $id" "Status: ${entry[3]}" "Progress: ${entry[5]}/${entry[4]}" "Rating: $rating" "Date: ${date}" "Tags: $tags" "$comment" | fold -s -w $presize | awk "{printf \"$line%s\", \$0}" | sed 's/!!NULL!!/\?/g')"
-    # Yah, OK so, the reason I add the placeholder "!!NULL!!" is because for some reason
-    # bash decides to repalce lone question marks when expanding them into an array...
-    # I really don't know...
-    # This will just serve as a crude fix until I figure out what's wrong
+
+    # Print each line with the given format, which aligns it correctly with space to give room for the image
+    final="$(printf "$fmt$fmt$fmt$fmt$fmt$fmt$fmt" "Id: $id" "Status: ${entry[3]}" "Progress: ${entry[5]}/${entry[4]}" "Rating: $rating" "Date: ${date}" "Tags: $tags" "$comment" | fold -s -w $presize | awk "{printf \"$line%s\", \$0}")"
 
     num="$(echo -n "${final}" | wc -l)"
     num="$(( 14 - num ))"
 
+
     echo -n "$final"
+    # Padding
     echo
     echo
 
-    if [[ "$image" != "!!NULL!!" ]]; then
+    imgcmd='cat > /dev/null'
+
+    if [[ "$TERM" == "xterm-kitty" ]]; then
+        imgcmd='kitty +kitten icat --silent --stdin yes --place="25x25@3x${y}"'
+    fi
+
+    if [[ "$image" != "$NULL" ]]; then
         (( num > 0 )) && printf "%${num}s" | tr ' ' $'\n'
         y="$(cursor_y)"
         y=$(( y - 15 ))
-        echo -n "${entry[8]}" | base64 -d | kitty +kitten icat --silent --stdin yes --place="25x25@3x${y}"
+        echo -n "${entry[8]}" | base64 -d | eval "$imgcmd"
     fi
 }
 
